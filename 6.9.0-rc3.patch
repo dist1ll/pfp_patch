@@ -1,0 +1,273 @@
+diff --git a/arch/x86/include/asm/string_64.h b/arch/x86/include/asm/string_64.h
+index 857d364b9..72b05eb84 100644
+--- a/arch/x86/include/asm/string_64.h
++++ b/arch/x86/include/asm/string_64.h
+@@ -21,6 +21,7 @@ extern void *__memcpy(void *to, const void *from, size_t len);
+ #define __HAVE_ARCH_MEMSET
+ void *memset(void *s, int c, size_t n);
+ void *__memset(void *s, int c, size_t n);
++void *memset_nt(void *s, int c, size_t n);
+ 
+ /*
+  * KMSAN needs to instrument as much code as possible. Use C versions of
+diff --git a/arch/x86/lib/memset_64.S b/arch/x86/lib/memset_64.S
+index 0199d56cb..40128d064 100644
+--- a/arch/x86/lib/memset_64.S
++++ b/arch/x86/lib/memset_64.S
+@@ -43,6 +43,28 @@ EXPORT_SYMBOL(__memset)
+ SYM_FUNC_ALIAS_MEMFUNC(memset, __memset)
+ EXPORT_SYMBOL(memset)
+ 
++SYM_FUNC_START(memset_nt)
++	lea -48(%rsp), %rsp
++	vmovdqu %ymm0,   (%rsp)
++	vmovdqu %xmm0, 32(%rsp)
++
++	vpxor  %xmm0,%xmm0,%xmm0
++	vpinsrb $0x0,%rsi,%xmm0,%xmm0
++	vpbroadcastb %xmm0,%ymm0
++.Lloop_set:
++	vmovntdq %ymm0,(%rdi)
++	add    $0x20,%rdi
++	sub    $0x20,%rdx
++	jne    .Lloop_set
++
++	sfence
++	vmovdqu 32(%rsp), %xmm0
++	vmovdqu   (%rsp), %ymm0
++	lea 48(%rsp), %rsp
++	RET
++SYM_FUNC_END(memset_nt)
++EXPORT_SYMBOL(memset_nt)
++
+ SYM_FUNC_START_LOCAL(memset_orig)
+ 	movq %rdi,%r10
+ 
+diff --git a/arch/x86/mm/fault.c b/arch/x86/mm/fault.c
+index 622d12ec7..440163b41 100644
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@ -1240,6 +1240,10 @@ void do_user_addr_fault(struct pt_regs *regs,
+ 	struct vm_area_struct *vma;
+ 	struct task_struct *tsk;
+ 	struct mm_struct *mm;
++	struct vm_fault_clear vmc = {
++		.from = NULL,
++		.len = 0,
++	};
+ 	vm_fault_t fault;
+ 	unsigned int flags = FAULT_FLAG_DEFAULT;
+ 
+@@ -1359,7 +1363,8 @@ void do_user_addr_fault(struct pt_regs *regs,
+ 		vma_end_read(vma);
+ 		goto lock_mmap;
+ 	}
+-	fault = handle_mm_fault(vma, address, flags | FAULT_FLAG_VMA_LOCK, regs);
++	fault = 
++		handle_mm_fault(vma, address, flags | FAULT_FLAG_VMA_LOCK, regs, &vmc);
+ 	if (!(fault & (VM_FAULT_RETRY | VM_FAULT_COMPLETED)))
+ 		vma_end_read(vma);
+ 
+@@ -1410,7 +1415,7 @@ void do_user_addr_fault(struct pt_regs *regs,
+ 	 * userland). The return to userland is identified whenever
+ 	 * FAULT_FLAG_USER|FAULT_FLAG_KILLABLE are both set in flags.
+ 	 */
+-	fault = handle_mm_fault(vma, address, flags, regs);
++	fault = handle_mm_fault(vma, address, flags, regs, &vmc);
+ 
+ 	if (fault_signal_pending(fault, regs)) {
+ 		/*
+@@ -1440,9 +1445,16 @@ void do_user_addr_fault(struct pt_regs *regs,
+ 
+ 	mmap_read_unlock(mm);
+ done:
+-	if (likely(!(fault & VM_FAULT_ERROR)))
++	if (likely(!(fault & VM_FAULT_ERROR))) {
++		/* After successful page fault, we can clear the page if the callee 
++		 * requested it. This avoids lock contention */
++		if (vmc.len > 0) {
++			// memset(vmc.from, 0, vmc.len);
++			memset_nt(vmc.from, 0, vmc.len);
++		}
+ 		return;
+-
++	}
++	
+ 	if (fatal_signal_pending(current) && !user_mode(regs)) {
+ 		kernelmode_fixup_or_oops(regs, error_code, address,
+ 					 0, 0, ARCH_DEFAULT_PKEY);
+diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+index 77b30a8c6..04f640526 100644
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -148,6 +148,7 @@ int hugetlb_report_node_meminfo(char *buf, int len, int nid);
+ void hugetlb_show_meminfo_node(int nid);
+ unsigned long hugetlb_total_pages(void);
+ vm_fault_t hugetlb_fault(struct mm_struct *mm, struct vm_area_struct *vma,
++			struct vm_fault_clear *vmc,
+ 			unsigned long address, unsigned int flags);
+ #ifdef CONFIG_USERFAULTFD
+ int hugetlb_mfill_atomic_pte(pte_t *dst_pte,
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 0436b919f..4ea71597c 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -507,6 +507,18 @@ static inline bool fault_flag_allow_retry_first(enum fault_flag flags)
+ 	{ FAULT_FLAG_INTERRUPTIBLE,	"INTERRUPTIBLE" }, \
+ 	{ FAULT_FLAG_VMA_LOCK,		"VMA_LOCK" }
+ 
++
++/* A request by the pagefault handler to defer the page clearing to the caller.
++ * This is useful to avoid clearing pages deep in the pagefault handler, where
++ * we are likely to hold on to locks, which may cause contention.
++ *
++ * The struct contains a start address and the length of memory to be cleared.
++ */
++struct vm_fault_clear {
++	void *from;
++	unsigned long len;
++};
++
+ /*
+  * vm_fault is filled by the pagefault handler and passed to the vma's
+  * ->fault function. The vma's ->fault is responsible for returning a bitmask
+@@ -2413,7 +2425,7 @@ struct vm_area_struct *lock_mm_and_find_vma(struct mm_struct *mm,
+ #ifdef CONFIG_MMU
+ extern vm_fault_t handle_mm_fault(struct vm_area_struct *vma,
+ 				  unsigned long address, unsigned int flags,
+-				  struct pt_regs *regs);
++				  struct pt_regs *regs, struct vm_fault_clear *vmc);
+ extern int fixup_user_fault(struct mm_struct *mm,
+ 			    unsigned long address, unsigned int fault_flags,
+ 			    bool *unlocked);
+@@ -2424,7 +2436,7 @@ void unmap_mapping_range(struct address_space *mapping,
+ #else
+ static inline vm_fault_t handle_mm_fault(struct vm_area_struct *vma,
+ 					 unsigned long address, unsigned int flags,
+-					 struct pt_regs *regs)
++					 struct pt_regs *regs,  struct vm_fault_clear *vmc)
+ {
+ 	/* should never happen if there's no MMU */
+ 	BUG();
+diff --git a/mm/gup.c b/mm/gup.c
+index af8edadc0..2e46a7793 100644
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -955,7 +955,7 @@ static int faultin_page(struct vm_area_struct *vma,
+ 		VM_BUG_ON(fault_flags & FAULT_FLAG_WRITE);
+ 	}
+ 
+-	ret = handle_mm_fault(vma, address, fault_flags, NULL);
++	ret = handle_mm_fault(vma, address, fault_flags, NULL, NULL);
+ 
+ 	if (ret & VM_FAULT_COMPLETED) {
+ 		/*
+@@ -1402,7 +1402,7 @@ int fixup_user_fault(struct mm_struct *mm,
+ 	    fatal_signal_pending(current))
+ 		return -EINTR;
+ 
+-	ret = handle_mm_fault(vma, address, fault_flags, NULL);
++	ret = handle_mm_fault(vma, address, fault_flags, NULL, NULL);
+ 
+ 	if (ret & VM_FAULT_COMPLETED) {
+ 		/*
+diff --git a/mm/hmm.c b/mm/hmm.c
+index 277ddcab4..e96a47905 100644
+--- a/mm/hmm.c
++++ b/mm/hmm.c
+@@ -77,7 +77,7 @@ static int hmm_vma_fault(unsigned long addr, unsigned long end,
+ 	}
+ 
+ 	for (; addr < end; addr += PAGE_SIZE)
+-		if (handle_mm_fault(vma, addr, fault_flags, NULL) &
++		if (handle_mm_fault(vma, addr, fault_flags, NULL, NULL) &
+ 		    VM_FAULT_ERROR)
+ 			return -EFAULT;
+ 	return -EBUSY;
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 23ef240ba..ce6371585 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -6208,6 +6208,7 @@ static bool hugetlb_pte_stable(struct hstate *h, struct mm_struct *mm,
+ 
+ static vm_fault_t hugetlb_no_page(struct mm_struct *mm,
+ 			struct vm_area_struct *vma,
++			struct vm_fault_clear *vmc,
+ 			struct address_space *mapping, pgoff_t idx,
+ 			unsigned long address, pte_t *ptep,
+ 			pte_t old_pte, unsigned int flags,
+@@ -6294,7 +6295,15 @@ static vm_fault_t hugetlb_no_page(struct mm_struct *mm,
+ 				ret = 0;
+ 			goto out;
+ 		}
+-		clear_huge_page(&folio->page, address, pages_per_huge_page(h));
++
++		/* Huge pages should always defer clearing */
++		if (vmc == NULL)
++			BUG();
++		void* from_addr = kmap_local_page(&folio->page);
++		vmc->from = from_addr;
++		vmc->len = (1 << h->order) * 4096;
++		kunmap_local(from_addr);
++
+ 		__folio_mark_uptodate(folio);
+ 		new_folio = true;
+ 
+@@ -6440,6 +6449,7 @@ u32 hugetlb_fault_mutex_hash(struct address_space *mapping, pgoff_t idx)
+ #endif
+ 
+ vm_fault_t hugetlb_fault(struct mm_struct *mm, struct vm_area_struct *vma,
++			struct vm_fault_clear *vmc,
+ 			unsigned long address, unsigned int flags)
+ {
+ 	pte_t *ptep, entry;
+@@ -6506,12 +6516,12 @@ vm_fault_t hugetlb_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		 * hugetlb_no_page will drop vma lock and hugetlb fault
+ 		 * mutex internally, which make us return immediately.
+ 		 */
+-		return hugetlb_no_page(mm, vma, mapping, vmf.pgoff, address,
++		return hugetlb_no_page(mm, vma, vmc, mapping, vmf.pgoff, address,
+ 					ptep, entry, flags, &vmf);
+ 	}
+ 
+ 	ret = 0;
+-
++	
+ 	/*
+ 	 * entry could be a migration/hwpoison entry at this point, so this
+ 	 * check prevents the kernel from going below assuming that we have
+diff --git a/mm/ksm.c b/mm/ksm.c
+index 8c001819c..5340fbc54 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -683,7 +683,7 @@ static int break_ksm(struct vm_area_struct *vma, unsigned long addr, bool lock_v
+ 			return 0;
+ 		ret = handle_mm_fault(vma, addr,
+ 				      FAULT_FLAG_UNSHARE | FAULT_FLAG_REMOTE,
+-				      NULL);
++				      NULL, NULL);
+ 	} while (!(ret & (VM_FAULT_SIGBUS | VM_FAULT_SIGSEGV | VM_FAULT_OOM)));
+ 	/*
+ 	 * We must loop until we no longer find a KSM page because
+diff --git a/mm/memory.c b/mm/memory.c
+index d2155ced4..2dfdd19f1 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -5572,7 +5572,7 @@ static vm_fault_t sanitize_fault_flags(struct vm_area_struct *vma,
+  * return value.  See filemap_fault() and __folio_lock_or_retry().
+  */
+ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+-			   unsigned int flags, struct pt_regs *regs)
++			   unsigned int flags, struct pt_regs *regs, struct vm_fault_clear *vmc)
+ {
+ 	/* If the fault handler drops the mmap_lock, vma may be freed */
+ 	struct mm_struct *mm = vma->vm_mm;
+@@ -5601,7 +5601,7 @@ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+ 	lru_gen_enter_fault(vma);
+ 
+ 	if (unlikely(is_vm_hugetlb_page(vma)))
+-		ret = hugetlb_fault(vma->vm_mm, vma, address, flags);
++		ret = hugetlb_fault(vma->vm_mm, vma, vmc, address, flags);
+ 	else
+ 		ret = __handle_mm_fault(vma, address, flags);
+ 
